@@ -1,0 +1,7 @@
+# System dependency (not pip-installable): ffmpeg must be on PATH for
+# trim_accident_clips.py (e.g. `apt-get install ffmpeg` / `brew install ffmpeg`).
+torch
+torchvision
+opencv-python
+numpy
+ultralytics

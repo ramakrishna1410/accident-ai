@@ -7,6 +7,7 @@ from torchvision.models.video import r3d_18
 # ----------------------------
 # LOAD MODEL
 # ----------------------------
+# Class order matches train_accident_model.py: index 0 = accident, index 1 = normal.
 model = r3d_18(weights=None)
 model.fc = nn.Linear(model.fc.in_features, 2)
 
@@ -57,7 +58,7 @@ while True:
             output = model(clip)
             probs = torch.softmax(output, dim=1)
 
-        accident_prob = probs[0][1].item()
+        accident_prob = probs[0][0].item()
         
         print("Accident probability:", accident_prob)
 

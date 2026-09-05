@@ -1,3 +1,4 @@
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -12,12 +13,25 @@ import numpy as np
 # ----------------------------
 # CONFIG
 # ----------------------------
-DATASET_PATH = "dataset/train"
-VAL_PATH = "dataset/val"
 CLIP_LEN = 16
-BATCH_SIZE = 2
-EPOCHS = 20
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Class order used throughout the project: index 0 = accident, index 1 = normal.
+# detect_accident_video.py must read the same index for "accident probability".
+CLASSES = ["accident", "normal"]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Fine-tune r3d_18 on trimmed accident/normal clips")
+    parser.add_argument("--train-dir", default="dataset/train", help="Dir with accident/ and normal/ subfolders")
+    parser.add_argument("--val-dir", default="dataset/val", help="Dir with accident/ and normal/ subfolders")
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=0.001)
+    parser.add_argument("--resume-from", default=None, help="Path to an existing accident_model.pth to continue training from")
+    parser.add_argument("--output", default="accident_model.pth", help="Where to save the trained model")
+    return parser.parse_args()
+
 
 # ----------------------------
 # VIDEO DATASET
@@ -32,8 +46,7 @@ class VideoDataset(Dataset):
                                  std=[0.22803, 0.22145, 0.216989])
         ])
 
-        classes = ["accident", "normal"]
-        for label, cls in enumerate(classes):
+        for label, cls in enumerate(CLASSES):
             cls_path = os.path.join(root_dir, cls)
             for file in os.listdir(cls_path):
                 if file.endswith(".mp4"):
@@ -49,6 +62,9 @@ class VideoDataset(Dataset):
         frames = []
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+        # Clips are pre-trimmed to the 2-5s accident/normal window by
+        # trim_accident_clips.py, so this samples a 16-frame sub-window from
+        # within that window rather than from arbitrary footage.
         start_frame = 0
         if total_frames > CLIP_LEN:
             start_frame = random.randint(0, total_frames - CLIP_LEN)
@@ -73,54 +89,75 @@ class VideoDataset(Dataset):
 
         return clip, torch.tensor(label, dtype=torch.long)
 
-# ----------------------------
-# LOAD MODEL
-# ----------------------------
-weights = R3D_18_Weights.DEFAULT
-model = r3d_18(weights=weights)
 
-# Freeze backbone (important)
-for param in model.parameters():
-    param.requires_grad = False
+def build_model(resume_from=None):
+    model = r3d_18(weights=None if resume_from else R3D_18_Weights.DEFAULT)
+    for param in model.parameters():
+        param.requires_grad = False
+    model.fc = nn.Linear(model.fc.in_features, len(CLASSES))
 
-# Replace final layer
-model.fc = nn.Linear(model.fc.in_features, 2)
-model = model.to(DEVICE)
+    if resume_from:
+        model.load_state_dict(torch.load(resume_from, map_location=DEVICE))
+        print(f"Resumed weights from {resume_from}")
 
-# ----------------------------
-# TRAIN SETUP
-# ----------------------------
-train_dataset = VideoDataset(DATASET_PATH)
-val_dataset = VideoDataset(VAL_PATH)
+    return model.to(DEVICE)
 
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
 
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.fc.parameters(), lr=0.001)
+def evaluate(model, val_loader):
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for clips, labels in val_loader:
+            clips, labels = clips.to(DEVICE), labels.to(DEVICE)
+            outputs = model(clips)
+            preds = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+    return correct / total if total else 0.0
 
-# ----------------------------
-# TRAIN LOOP
-# ----------------------------
-for epoch in range(EPOCHS):
-    model.train()
-    total_loss = 0
 
-    for clips, labels in train_loader:
-        clips, labels = clips.to(DEVICE), labels.to(DEVICE)
+def main():
+    args = parse_args()
 
-        outputs = model(clips)
-        loss = criterion(outputs, labels)
+    model = build_model(args.resume_from)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    train_dataset = VideoDataset(args.train_dir)
+    val_dataset = VideoDataset(args.val_dir)
 
-        total_loss += loss.item()
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
 
-    print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {total_loss:.4f}")
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.fc.parameters(), lr=args.lr)
 
-print("Training Complete")
+    best_val_acc = 0.0
+    for epoch in range(args.epochs):
+        model.train()
+        total_loss = 0
 
-torch.save(model.state_dict(),"accident_model.pth")
-print("Model saved as accident_model.pth")
+        for clips, labels in train_loader:
+            clips, labels = clips.to(DEVICE), labels.to(DEVICE)
+
+            outputs = model(clips)
+            loss = criterion(outputs, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        val_acc = evaluate(model, val_loader)
+        print(f"Epoch {epoch+1}/{args.epochs}, Loss: {total_loss:.4f}, Val Acc: {val_acc:.4f}")
+
+        if val_acc >= best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), args.output)
+            print(f"Saved new best model (val acc {val_acc:.4f}) to {args.output}")
+
+    print(f"Training complete. Best val acc: {best_val_acc:.4f}")
+
+
+if __name__ == "__main__":
+    main()
